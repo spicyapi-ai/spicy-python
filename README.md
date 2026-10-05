@@ -122,14 +122,14 @@ Branch on `code`, never on the message text — messages are translated, codes a
 
 - [Documentation](https://docs.spicyapi.ai)
 - [API reference](https://docs.spicyapi.ai/docs/api-reference)
-- [Source](https://github.com/Spicy-API/spicy-python)
+- [Source](https://github.com/spicyapi-ai/spicy-python)
 
 ---
 
 <div align="center">
 <sub>
 
-Also available in [TypeScript](https://github.com/Spicy-API/spicy-sdk) · **Python** · [Go](https://github.com/Spicy-API/spicy-go) · [PHP](https://github.com/Spicy-API/spicy-php) · [Java](https://github.com/Spicy-API/spicy-java)
+Also available in [TypeScript](https://github.com/spicyapi-ai/spicy-sdk) · **Python** · [Go](https://github.com/spicyapi-ai/spicy-go) · [PHP](https://github.com/spicyapi-ai/spicy-php) · [Java](https://github.com/spicyapi-ai/spicy-java)
 
 </sub>
 </div>

@@ -29,7 +29,7 @@ dependencies = []
 [project.urls]
 Homepage = "https://spicyapi.ai"
 Documentation = "https://docs.spicyapi.ai"
-Source = "https://github.com/Spicy-API/spicy-python"
+Source = "https://github.com/spicyapi-ai/spicy-python"
 Issues = "https://spicyapi.ai/contact"
 
 [tool.hatch.version]
