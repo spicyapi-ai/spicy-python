@@ -1,8 +1,11 @@
 """Official SpicyAPI client for Python 3.11+.
 
-SpicyAPI serves image and video generation models behind one API. Text models are
-not covered on purpose: they speak the OpenAI, Anthropic and Gemini wire formats,
-so the official libraries for those already work against this service.
+SpicyAPI serves image, video and audio generation models behind one API. Text
+models are not covered on purpose: they speak the OpenAI, Anthropic and Gemini
+wire formats, so the official libraries for those already work against this
+service. The upload helpers here still apply to them: an audio part in a chat
+message accepts only an uploaded ``spicy://f/...`` URI, and video is reliable
+only as one.
 
 Depends on the standard library only. The ten-minute polling deadline is a local
 safety bound, not a service guarantee.
@@ -42,7 +45,7 @@ ACTIVE_STATES = frozenset({"queued", "running"})
 # imports this module, so reading it the other way round would be a circular import; and the tests
 # load this file as a standalone module with no parent package, where a relative import is bound to
 # fail. Both __init__.py and pyproject read it from here.
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 # Local ceiling on response bodies. See _read_capped: this number is ours, not the contract's.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -59,19 +62,51 @@ NON_RETRYABLE_CODES = frozenset({50302})
 
 IMAGE_CONTENT_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 AUDIO_VIDEO_CONTENT_TYPES = frozenset({"video/mp4", "video/webm", "audio/mpeg", "audio/wav"})
-UPLOAD_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_VIDEO_CONTENT_TYPES
+# Reference documents, for models whose schema takes a file field (for example generating a video
+# from a brief). The platform checks the file signature and the size, never the content.
+DOCUMENT_CONTENT_TYPES = frozenset({
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.apple.keynote",
+    "application/vnd.apple.pages",
+    "application/vnd.apple.numbers",
+    "text/plain",
+    "text/markdown",
+})
+UPLOAD_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_VIDEO_CONTENT_TYPES | DOCUMENT_CONTENT_TYPES
 MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+# Documents share the audio and video ceiling: a PDF or a slide deck with pictures in it is often
+# larger than any single image, and the platform signs both against the same 90 MiB line.
 MAX_AUDIO_VIDEO_UPLOAD_BYTES = 90 * 1024 * 1024
+MAX_DOCUMENT_UPLOAD_BYTES = MAX_AUDIO_VIDEO_UPLOAD_BYTES
 CONTENT_TYPE_BY_SUFFIX = {
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".gif": "image/gif",
     ".jpeg": "image/jpeg",
     ".jpg": "image/jpeg",
+    ".key": "application/vnd.apple.keynote",
+    ".markdown": "text/markdown",
+    ".md": "text/markdown",
     ".mp3": "audio/mpeg",
     ".mp4": "video/mp4",
+    ".numbers": "application/vnd.apple.numbers",
+    ".pages": "application/vnd.apple.pages",
+    ".pdf": "application/pdf",
     ".png": "image/png",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".txt": "text/plain",
     ".wav": "audio/wav",
     ".webm": "video/webm",
     ".webp": "image/webp",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
 WEBHOOK_TOLERANCE_SECONDS = 300
@@ -88,6 +123,11 @@ RECOVERY_BY_CODE: Mapping[int, str] = {
     40004: (
         "the request is valid but no deployment serves this parameter combination: change the "
         "parameter named in the message, or pick another model. The identical request fails again"
+    ),
+    40310: (
+        "the account has not verified its email address yet, so it cannot run models: open the "
+        "verification link sent at sign-up, or send a new one from the Console. The same key "
+        "works as soon as the address is verified; resending before that is refused again"
     ),
     40901: (
         "the quote expired or the price changed before the funds were reserved: quote again and "
@@ -286,7 +326,8 @@ def output_text(task: Mapping[str, Any]) -> str | None:
 
     Some endpoints answer in ``output.text`` and carry no ``assets`` key at
     all, so reading ``task["output"]["assets"]`` directly raises KeyError on a
-    perfectly successful task.
+    perfectly successful task. Speech-to-text is one of them: this is the plain
+    transcript, and ``output_transcript`` returns the timed version.
     """
     output = task.get("output")
     if not isinstance(output, Mapping):
@@ -295,11 +336,31 @@ def output_text(task: Mapping[str, Any]) -> str | None:
     return text if isinstance(text, str) else None
 
 
+def output_transcript(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The structured transcript of a speech-to-text task, or None.
+
+    Carries ``text``, the detected ``language`` and ``languageCode``,
+    ``durationSeconds``, ``words`` (each with ``text``, ``start`` and ``end`` in
+    seconds, plus ``speakerId`` when the model separates speakers) and, for a
+    multichannel request, ``channels``. Only some transcription endpoints return
+    it, and it is erased with the rest of the output on the retention schedule,
+    so None is an ordinary answer: fall back to ``output_text`` for the plain
+    transcript.
+    """
+    output = task.get("output")
+    if not isinstance(output, Mapping):
+        return None
+    transcript = output.get("transcript")
+    return dict(transcript) if isinstance(transcript, Mapping) else None
+
+
 def output_assets(task: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Generated files of a finished task, or an empty list.
 
     Returns [] both for a text answer and for a failed task, so callers never
-    have to distinguish "no assets key" from "empty assets list".
+    have to distinguish "no assets key" from "empty assets list". Every key of
+    an asset is kept as received, including ``layer`` (``zIndex``, ``name``,
+    ``boundingBox``) on layer decomposition results.
     """
     output = task.get("output")
     if not isinstance(output, Mapping):
@@ -324,11 +385,11 @@ def content_type_for_path(path: str) -> str:
 
 def max_upload_bytes(content_type: str) -> int:
     """Platform ceiling for this media type. A model's schema may allow less."""
-    return (
-        MAX_IMAGE_UPLOAD_BYTES
-        if content_type in IMAGE_CONTENT_TYPES
-        else MAX_AUDIO_VIDEO_UPLOAD_BYTES
-    )
+    if content_type in IMAGE_CONTENT_TYPES:
+        return MAX_IMAGE_UPLOAD_BYTES
+    if content_type in DOCUMENT_CONTENT_TYPES:
+        return MAX_DOCUMENT_UPLOAD_BYTES
+    return MAX_AUDIO_VIDEO_UPLOAD_BYTES
 
 
 def compute_webhook_signature(
@@ -523,6 +584,7 @@ class SpicyClient:
         quote_id: str | None = None,
         expected_cost: str | None = None,
         wait_seconds: int | None = None,
+        retention_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Submit one asynchronous generation task.
 
@@ -558,9 +620,31 @@ class SpicyClient:
         refused, since that is a caller mistake rather than a platform limit that
         could be relaxed later. Disconnecting stops the wait and nothing else —
         the task keeps running and is billed as usual.
+
+        retention_seconds is sent as ``X-Spicy-Retention`` and shortens how long
+        this one task's outputs and stored request text are kept. It only ever
+        shortens: the effective value is the smallest of this, the account
+        setting and the platform maximum, and it comes back in the task record's
+        ``retention``, which is where to read it. ``0`` removes the outputs as
+        soon as the task reaches a terminal state, so download them from the
+        terminal record straight away. Only a negative or non-integer value is
+        refused here (the server would silently ignore a non-integer and keep
+        the account setting); the ceiling is the platform's to clamp.
+        ``retry_task`` takes none of its own: a retry inherits its source task's
+        retention.
         """
         if not idempotency_key.strip():
             raise ValueError("Idempotency-Key is required")
+        request_headers = {"Idempotency-Key": idempotency_key}
+        if retention_seconds is not None:
+            # The server ignores anything that is not a decimal integer and keeps the account
+            # setting, without saying so: 3600.0 would go out as "3600.0", and True (an int
+            # subclass) as "True". Refuse both here, where the caller can still see why.
+            if isinstance(retention_seconds, bool) or not isinstance(retention_seconds, int):
+                raise ValueError("retention_seconds must be a whole number of seconds")
+            if retention_seconds < 0:
+                raise ValueError("retention_seconds must not be negative")
+            request_headers["X-Spicy-Retention"] = str(retention_seconds)
         body: dict[str, Any] = {"model": model, "input": dict(input_data)}
         if callback_url is not None:
             body["callBackUrl"] = callback_url
@@ -583,7 +667,7 @@ class SpicyClient:
             "POST",
             path,
             body=body,
-            headers={"Idempotency-Key": idempotency_key},
+            headers=request_headers,
             timeout_seconds=timeout_seconds,
         )
 
@@ -829,7 +913,9 @@ class SpicyClient:
         """Ticket, PUT and commit in one call; returns the commit record.
 
         Put the returned ``uri`` into the model input field whose x-ui.widget
-        is "upload" (or inside the list for "multi-upload").
+        is "upload" (or inside the list for "multi-upload"), or into the
+        ``url`` of an ``image_url`` / ``video_url`` / ``audio_url`` part of a
+        chat message sent through an OpenAI-compatible library.
         """
         ticket = self.create_upload_url(content_type=content_type, byte_count=len(data))
         max_bytes = ticket.get("maxBytes")

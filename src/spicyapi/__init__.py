@@ -17,6 +17,7 @@ from ._client import (
     is_terminal,
     output_assets,
     output_text,
+    output_transcript,
     verify_webhook,
 )
 
@@ -33,6 +34,7 @@ __all__ = [
     "is_terminal",
     "output_assets",
     "output_text",
+    "output_transcript",
     "verify_webhook",
 ]
 

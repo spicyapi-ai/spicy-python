@@ -247,7 +247,8 @@ class UploadTests(unittest.TestCase):
             transport.calls[2][1].endswith("/files/fil_01k3m8x9q2z4v7n5p6r8s0t1w3/commit")
         )
 
-        # The declared byte count must equal the real one: a byte either way and commit answers 40003.
+        # The declared byte count must equal the real one: a byte either way and commit answers
+        # 40003.
         self.assertEqual(
             json.loads(transport.calls[0][3]), {"contentType": "image/png", "bytes": 4}
         )
@@ -280,7 +281,7 @@ class UploadTests(unittest.TestCase):
         transport = QueueTransport([])
         client = self.client(transport, max_retries=0)
 
-        # The contract accepts exactly these eight; a wrong type means commit reports 40003 only
+        # The contract accepts a closed list of types; a wrong type means commit reports 40003 only
         # after 90 MiB has already been transferred.
         with self.assertRaises(ValueError):
             client.create_upload_url(content_type="image/svg+xml", byte_count=4)
@@ -338,8 +339,59 @@ class UploadTests(unittest.TestCase):
     def test_upload_file_infers_content_type_from_the_name(self):
         self.assertEqual(client_module.content_type_for_path("/tmp/a.PNG"), "image/png")
         self.assertEqual(client_module.content_type_for_path("clip.mp4"), "video/mp4")
+        # Formats outside the published upload contract must still be refused by name, before any
+        # bytes move. The local list follows the contract, not what some console path may convert.
+        for unsupported in ("logo.svg", "photo.heic", "clip.mov", "archive.zip"):
+            with self.subTest(path=unsupported), self.assertRaises(ValueError):
+                client_module.content_type_for_path(unsupported)
+
+    def test_reference_documents_can_be_uploaded(self):
+        """Documents joined the upload contract for models whose schema takes a file field.
+
+        Leaving them out of the local allow-list would refuse a valid upload before it ever reached
+        the server, with an error that reads like the platform does not support the format.
+        """
+        cases = {
+            "brief.pdf": "application/pdf",
+            "brief.doc": "application/msword",
+            "brief.DOCX": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "sheet.xls": "application/vnd.ms-excel",
+            "sheet.xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "deck.ppt": "application/vnd.ms-powerpoint",
+            "deck.pptx": (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            ),
+            "deck.key": "application/vnd.apple.keynote",
+            "story.pages": "application/vnd.apple.pages",
+            "budget.numbers": "application/vnd.apple.numbers",
+            "notes.txt": "text/plain",
+            "notes.md": "text/markdown",
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(client_module.content_type_for_path(path), expected)
+                self.assertIn(expected, client_module.UPLOAD_CONTENT_TYPES)
+        # Every document type in the contract has a suffix that infers it, so upload_file works on
+        # all of them without an explicit content_type.
+        self.assertEqual(set(cases.values()), set(client_module.DOCUMENT_CONTENT_TYPES))
+
+        # Documents share the 90 MiB audio and video line, not the 10 MiB image one: a PDF with
+        # pictures in it is routinely larger than 10 MiB.
+        limit = 90 * 1024 * 1024
+        self.assertEqual(client_module.max_upload_bytes("application/pdf"), limit)
+        self.assertEqual(client_module.max_upload_bytes("text/plain"), limit)
+
+        transport = QueueTransport([
+            response({"code": 200, "msg": "success", "data": UPLOAD_TICKET}),
+        ])
+        client = self.client(transport, max_retries=0)
+        client.create_upload_url(content_type="application/pdf", byte_count=limit)
+        self.assertEqual(
+            json.loads(transport.calls[0][3]), {"contentType": "application/pdf", "bytes": limit}
+        )
         with self.assertRaises(ValueError):
-            client_module.content_type_for_path("notes.txt")
+            client.create_upload_url(content_type="application/pdf", byte_count=limit + 1)
+        self.assertEqual(len(transport.calls), 1)
 
 
 class QuoteAndLifecycleTests(unittest.TestCase):
@@ -580,6 +632,55 @@ class ResultAndErrorSemanticsTests(unittest.TestCase):
         failed = {"state": "failed", "errorCode": "content_rejected"}
         self.assertEqual(client_module.output_assets(failed), [])
         self.assertIsNone(client_module.output_text(failed))
+        self.assertIsNone(client_module.output_transcript(failed))
+
+    def test_transcript_is_read_without_assuming_it_is_there(self):
+        transcript = {
+            "text": "hello there",
+            "language": "en",
+            "languageCode": "eng",
+            "durationSeconds": 1.4,
+            "words": [
+                {"text": "hello", "start": 0.1, "end": 0.5, "type": "word", "speakerId": "s0"},
+                {"text": "there", "start": 0.6, "end": 1.0, "type": "word", "speakerId": "s0"},
+            ],
+        }
+        task = {
+            "state": "succeeded",
+            "output": {"text": "hello there", "transcript": transcript},
+        }
+        # The plain transcript stays in output.text; the timed one is a separate object.
+        self.assertEqual(client_module.output_text(task), "hello there")
+        self.assertEqual(client_module.output_transcript(task), transcript)
+        self.assertEqual(client_module.output_assets(task), [])
+        # A copy, so editing the result does not edit the task record the caller still holds.
+        client_module.output_transcript(task)["words"] = []
+        self.assertEqual(len(task["output"]["transcript"]["words"]), 2)
+
+        # Only some transcription endpoints return the structured form, and retention erases it:
+        # None is an ordinary answer, not an error.
+        plain_only = {"state": "succeeded", "output": {"text": "hello there"}}
+        self.assertIsNone(client_module.output_transcript(plain_only))
+        malformed = {"state": "succeeded", "output": {"transcript": "hello there"}}
+        self.assertIsNone(client_module.output_transcript(malformed))
+
+    def test_layer_metadata_survives_output_assets(self):
+        task = {
+            "state": "succeeded",
+            "output": {"assets": [
+                {"key": "o/0", "url": "https://cdn.example/base.png", "layer": {"zIndex": 0}},
+                {
+                    "key": "o/1",
+                    "url": "https://cdn.example/1.png",
+                    "layer": {"zIndex": 1, "name": "cup", "boundingBox": [10, 20, 110, 220]},
+                },
+            ]},
+        }
+        layers = [asset["layer"] for asset in client_module.output_assets(task)]
+        # Rebuilding the picture needs the stacking order and the placement, so neither may be
+        # dropped on the way out.
+        self.assertEqual(layers[0], {"zIndex": 0})
+        self.assertEqual(layers[1]["boundingBox"], [10, 20, 110, 220])
 
     def test_wait_keeps_polling_while_assets_are_pending(self):
         transport = QueueTransport([
@@ -673,6 +774,25 @@ class ResultAndErrorSemanticsTests(unittest.TestCase):
             self.client(transport, max_retries=0).get_balance()
         self.assertEqual(raised.exception.code, 50302)
         self.assertIn("refunded", raised.exception.recovery)
+
+    def test_an_unverified_email_is_named_and_not_resent(self):
+        """40310 is what a brand-new account meets on its first call.
+
+        It rides on a 403, the same status as a key restriction or an IP allow-list miss, so the
+        status alone sends people to the key settings. Only verifying the address fixes it, and
+        resending before that earns the identical answer.
+        """
+        transport = QueueTransport([
+            response({"code": 40310, "msg": "verify your email", "request_id": "r"}, 403),
+            response({"code": 200, "msg": "success", "data": {}}),
+        ])
+        client = self.client(transport, max_retries=3)
+        with self.assertRaises(client_module.SpicyApiError) as raised:
+            client.create_task(model="m", input_data={}, idempotency_key="k")
+        self.assertEqual(raised.exception.status, 403)
+        self.assertEqual(raised.exception.code, 40310)
+        self.assertIn("verif", raised.exception.recovery)
+        self.assertEqual(len(transport.calls), 1)
 
 
 class WebhookVerificationTests(unittest.TestCase):
@@ -865,11 +985,13 @@ class PublishReadinessTests(unittest.TestCase):
         The contract says this idempotency key has already recorded the failure, and reusing it
         only replays that failure. Retrying is not fatal - nothing is charged twice - but it makes a
         doomed request take four attempts to report, and the final error reads as "we retried and it
-        still failed", burying the actual remedy: a fresh idempotency key. 50301 is the control: that
-        one should be retried.
+        still failed", burying the actual remedy: a fresh idempotency key. 50301 is the control:
+        that one should be retried.
         """
-        for code, expected, why in [(50302, 1, "a recorded failure must not be replayed"),
-                                    (50301, 4, "ordinary upstream unavailability should be retried")]:
+        for code, expected, why in [
+            (50302, 1, "a recorded failure must not be replayed"),
+            (50301, 4, "ordinary upstream unavailability should be retried"),
+        ]:
             with self.subTest(code=code):
                 attempts = []
 
@@ -949,10 +1071,62 @@ class PublishReadinessTests(unittest.TestCase):
 
         client = client_module.SpicyClient(api_key="sk-spicy-x", transport=transport)
         task = client.create_task(model="m", input_data={}, idempotency_key="k", wait_seconds=30)
-        self.assertFalse(client_module.is_terminal(task),
-                         "an acceptance response returned once the budget ran out was read as terminal")
+        self.assertFalse(
+            client_module.is_terminal(task),
+            "an acceptance response returned once the budget ran out was read as terminal",
+        )
         self.assertTrue(client_module.is_terminal({"state": "succeeded"}))
         self.assertTrue(client_module.is_terminal({"state": "failed"}))
+
+    def test_retention_goes_out_as_a_header_and_only_negatives_are_refused(self):
+        """X-Spicy-Retention can only shorten retention, and the server clamps the ceiling.
+
+        Copying the ceiling into the client would reject a working value the day the platform
+        raises it. What the client can decide locally are the values the server would quietly
+        reinterpret: a negative is clamped to 0, which deletes the outputs the moment the task
+        ends, and a non-integer is ignored in favour of the account setting. Either way the caller
+        should hear about it here, not from outputs that vanished early or never expired.
+        """
+        seen = []
+
+        def transport(method, url, headers, body, timeout):
+            seen.append((url, dict(headers), body))
+            return 202, {}, json.dumps(
+                {"code": 200, "msg": "ok", "data": {"taskId": "job-1", "state": "queued"}}
+            ).encode()
+
+        client = client_module.SpicyClient(api_key="sk-spicy-x", transport=transport)
+
+        client.create_task(model="m", input_data={}, idempotency_key="k1", retention_seconds=3600)
+        url, headers, body = seen[-1]
+        self.assertEqual(headers["X-Spicy-Retention"], "3600")
+        self.assertEqual(headers["Idempotency-Key"], "k1")
+        # A header, not a body field or a query parameter: the request body is validated with
+        # additionalProperties false and would refuse an extra key.
+        self.assertNotIn("retention", json.loads(body))
+        self.assertNotIn("retention", url.lower())
+
+        # Zero is a real value - remove the outputs as soon as the task ends - not "unset".
+        client.create_task(model="m", input_data={}, idempotency_key="k2", retention_seconds=0)
+        self.assertEqual(seen[-1][1]["X-Spicy-Retention"], "0")
+
+        # Far above any platform ceiling still goes out verbatim; clamping is the server's job.
+        client.create_task(
+            model="m", input_data={}, idempotency_key="k3", retention_seconds=10**9
+        )
+        self.assertEqual(seen[-1][1]["X-Spicy-Retention"], str(10**9))
+
+        # Not passing it means the header is absent, so the account setting applies.
+        client.create_task(model="m", input_data={}, idempotency_key="k4")
+        self.assertNotIn("X-Spicy-Retention", seen[-1][1])
+
+        sent = len(seen)
+        for bad in (-1, 3600.0, True, "3600"):
+            with self.subTest(retention_seconds=bad), self.assertRaises(ValueError):
+                client.create_task(
+                    model="m", input_data={}, idempotency_key="k5", retention_seconds=bad
+                )
+        self.assertEqual(len(seen), sent, "a refused retention value still reached the network")
 
     def test_list_tasks_does_not_cap_the_limit_locally(self):
         """Platform limits are not enforced client-side.
