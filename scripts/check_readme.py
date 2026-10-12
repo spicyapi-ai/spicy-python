@@ -9,7 +9,9 @@ SDK.
 
 It checks three statically decidable things, which between them cover both shapes:
   1. every code block survives ast.parse (the syntax is intact);
-  2. every method named in ``client.<method>(...)`` really exists on SpicyClient;
+  2. every method named in ``client.<method>(...)`` really exists on SpicyClient, and every
+     ``client.assets.<method>(...)`` / ``client.assets.characters.<method>(...)`` on its namespace -
+     with every required argument passed and no misspelled keyword;
   3. calls to module-level exports pass every required argument and no misspelled keyword.
 Nothing is executed - the examples issue real network requests, which would be both slow and
 billable.
@@ -26,11 +28,62 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 import spicyapi  # noqa: E402
-from spicyapi import SpicyClient  # noqa: E402
+from spicyapi import SpicyAssetCharacters, SpicyAssets, SpicyClient  # noqa: E402
 
 BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
 # These names come from the reader's own framework, not from our export surface.
 FOREIGN = {"request", "os", "uuid", "json", "pathlib", "sys"}
+# The namespaces reachable from a client, by attribute path. They are set on the instance, so the
+# class alone cannot say what ``client.assets`` is.
+NAMESPACES: dict[tuple[str, ...], type] = {
+    (): SpicyClient,
+    ("assets",): SpicyAssets,
+    ("assets", "characters"): SpicyAssetCharacters,
+}
+
+
+def client_chain(func: ast.expr) -> list[str] | None:
+    """``["assets", "create"]`` for ``client.assets.create``; None when it is not ``client...``."""
+    parts: list[str] = []
+    node = func
+    while isinstance(node, ast.Attribute):
+        parts.insert(0, node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id == "client" and parts:
+        return parts
+    return None
+
+
+def argument_problems(where: str, label: str, target: object, node: ast.Call) -> list[str]:
+    """Required arguments missing from a call, and keywords the target does not take."""
+    try:
+        signature = inspect.signature(target)
+    except (TypeError, ValueError):
+        return []
+    parameters = dict(signature.parameters)
+    parameters.pop("self", None)
+    problems: list[str] = []
+    given = {kw.arg for kw in node.keywords if kw.arg}
+    positional = len(node.args)
+    splatted = any(kw.arg is None for kw in node.keywords) or any(
+        isinstance(arg, ast.Starred) for arg in node.args
+    )
+    for name, parameter in parameters.items():
+        if parameter.default is not inspect.Parameter.empty:
+            continue
+        if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if name in given:
+            continue
+        if parameter.kind is not inspect.Parameter.KEYWORD_ONLY and positional > 0:
+            positional -= 1
+            continue
+        if not splatted:
+            problems.append(f"{where}: {label}() is missing required argument {name}")
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        for name in sorted(given - set(parameters)):
+            problems.append(f"{where}: {label}() has no argument named {name}")
+    return problems
 
 
 def main() -> int:
@@ -54,23 +107,29 @@ def main() -> int:
             if not isinstance(node, ast.Call):
                 continue
 
-            # 2. client.<method>(...)
+            # 2. client.<method>(...) and client.<namespace>.<method>(...)
             func = node.func
-            if (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "client"
-            ):
-                if not hasattr(SpicyClient, func.attr):
-                    hint = ""
-                    if hasattr(spicyapi, func.attr):
-                        hint = (
-                            f" - it is a module-level function, so write {func.attr}(...) "
-                            f"rather than client.{func.attr}(...)"
-                        )
+            chain = client_chain(func)
+            if chain is not None:
+                *prefix, method = chain
+                label = "client." + ".".join(chain)
+                owner = NAMESPACES.get(tuple(prefix))
+                if owner is None:
                     problems.append(
-                        f"{where}: SpicyClient has no method {func.attr}(){hint}"
+                        f"{where}: client.{'.'.join(prefix)} is not a namespace of SpicyClient"
                     )
+                    continue
+                target = getattr(owner, method, None)
+                if not callable(target):
+                    hint = ""
+                    if not prefix and hasattr(spicyapi, method):
+                        hint = (
+                            f" - it is a module-level function, so write {method}(...) "
+                            f"rather than client.{method}(...)"
+                        )
+                    problems.append(f"{where}: {owner.__name__} has no method {method}(){hint}")
+                    continue
+                problems.extend(argument_problems(where, label, target, node))
                 continue
 
             # 3. required arguments of module-level exports

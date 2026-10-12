@@ -54,7 +54,9 @@ Build the `input` from that model's own `inputSchema` — every model has differ
 Image-to-video, face swap, image editing, lip sync and transcription all need your material on our
 side first. Upload returns a `spicy://` URI; that is what goes into `input`. Images (JPEG, PNG,
 WebP, GIF) go up to 10 MiB; video (MP4, WebM), audio (MP3, WAV) and reference documents (PDF,
-Word, Excel, PowerPoint, Keynote, Pages, Numbers, plain text, Markdown) up to 90 MiB.
+Word, Excel, PowerPoint, Keynote, Pages, Numbers, plain text, Markdown) up to 90 MiB; LoRA weights
+(a `.safetensors` file, sent as `application/octet-stream`, for `loras[].path`) up to 2 GiB. For a
+file that large, raise `upload_timeout_seconds` on the client above its ten-minute default.
 
 ```python
 uploaded = client.upload_file("/path/to/reference.png")
@@ -64,6 +66,120 @@ task = client.create_task(
     idempotency_key=str(uuid.uuid4()),
 )
 ```
+
+An upload's URI lasts one day. To keep a file for later requests, save it to the
+[asset library](#asset-library).
+
+## Asset library
+
+Files you use again and again — a character portrait, a style reference, a voice sample — belong in
+your asset library: each saved file gets a stable `uri` of the form `spicy://a/<id>` that works in
+any media field of model inputs sent with keys of the same workspace, until it is deleted. The
+library never hands out a public or permanent link.
+
+The key decides the library. A key created in your personal workspace reaches your personal library;
+a key created in a team workspace, by any member, reaches that team's shared library and never
+anyone's personal one. With a team key, what may change follows the current role of the member who
+created it: owner and admin can save, rename, favorite and delete anything; developer can save, and
+rename, favorite or delete what they saved; billing and readonly can only read and use assets.
+
+```python
+from spicyapi import SpicyClient
+
+client = SpicyClient()
+
+# Save the first output of one of your successful tasks (with a team key, one of the team's).
+# source="url" with url=..., and source="upload" with file_id=..., work the same way. The required
+# Idempotency-Key is added for you.
+hero = client.assets.create(source="task_output", task_id="job_...", index=0, name="Hero portrait")
+
+# Or upload a local file and save it in one call; the name defaults to the file name.
+voice = client.assets.upload_file("./voice-sample.wav")
+
+# Later, in any request: the uri goes where the model's schema expects a file.
+input_data = {"prompt": "Slow push-in, light rain", "image_url": hero["uri"]}
+
+# Every saved image, newest first, across all pages.
+for asset in client.assets.iter_all(kind="image", q="portrait"):
+    print(asset["uri"], asset["name"], asset["bytes"])
+```
+
+| Method | Returns |
+| --- | --- |
+| `assets.create(source=..., task_id=, key=, index=, file_id=, url=, name=, idempotency_key=)` | The saved asset: `id`, `uri`, `name`, `kind`, `bytes`, `favorite`, `model`, `previewUrl`, … |
+| `assets.upload_file(path, name=, content_type=)` | Uploads with `upload_file`, then saves; the saved asset |
+| `assets.list(kind=, source=, q=, favorite=, collection_id=, entity_id=, sort=, cursor=, limit=)` | One page: `items`, `nextCursor` (absent on the last page) |
+| `assets.iter_all(...)` | An iterator over every matching asset, with the same filters as `list` |
+| `assets.get(asset_id)` | One asset with a fresh `previewUrl` |
+| `assets.update(asset_id, name=, favorite=)` | The updated asset; only the fields you pass change, the `uri` stays the same |
+| `assets.delete(asset_id)` | `{"id": ..., "deleted": True}`; the `uri` stops working at once |
+| `assets.usage()` | `scope` (which library, role, `canWrite`, `canTopUp`), plan, usage |
+| `assets.characters.list(asset_id=, cursor=, limit=)` / `iter_all(...)` | Characters, newest first: `id`, `name`, `note`, `cover`, `assets` (the images in order), `count` |
+| `assets.characters.get(character_id)` | One character with its images in order |
+
+- `asset_id` may be the bare `ast_…` id or the `spicy://a/…` reference. An empty id, a blank filter
+  or an unknown `sort` raises `ValueError` before anything is sent.
+- `source` takes one value or a list of them (`task_output`, `upload`, `url`). `favorite=True` lists
+  only favorites and `favorite=False` only the rest; leave it as `None` for both.
+- `sort` is `recent` (the default, newest first), `oldest`, `name` or `size`. A `nextCursor` only
+  works with the `sort` it came from; sending it with another one fails with `400`, which is raised
+  as-is and not retried. `iter_all` keeps your filters and `sort` on every page.
+- Saving the same task output, upload or URL again returns the asset you already have. Pass your own
+  `idempotency_key` to replay a save safely after an uncertain response, for example across a
+  restart.
+- `previewUrl` is a private preview signed for at most 20 minutes. Show it; store `uri`.
+- Storage unlocks with the owner's lifetime top-ups, and the owner's personal and team libraries
+  share one allowance. `assets.usage()` reports the whole allowance; with a team key whose creator
+  is not the owner, `scope.canTopUp` is false and `lifetimeTopupUsd` and `topupToNextTierUsd` are
+  omitted, so read both with `.get`.
+- A refused call raises `SpicyApiError` with a `reason`: `asset_library_locked`,
+  `asset_library_full` and `asset_file_too_large` (400, plan limits — read `assets.usage()` for the
+  numbers), `asset_daily_limit` (429, resets at 00:00 UTC, with `retry_after_seconds`),
+  `asset_storage_full` (503, temporary), `asset_permission_denied` (403, the team role does not
+  allow this change), `asset_workspace_forbidden` (403, this key cannot reach that library, for
+  example because its creator left the team) and `asset_entity_name_taken` (409, a character with
+  that name already exists). The set, which matches the contract, is exported as
+  `ASSET_ERROR_REASONS`; `reason` carries any other value the server sends unchanged, so keep a
+  default branch.
+
+```python
+from spicyapi import SpicyApiError
+
+try:
+    client.assets.create(source="url", url="https://example.com/still.png")
+except SpicyApiError as error:
+    if error.reason != "asset_library_full":
+        raise
+    usage = client.assets.usage()
+    next_tier = (usage.get("nextTier") or {}).get("name", "none")
+    print(f"Full on {usage['tier']['name']}; next plan: {next_tier}")
+```
+
+### Favorites, folders and characters
+
+Every asset has a `favorite` flag; in a team library everyone sees the same favorites. Folders
+(collections in the API) and characters are created and arranged on the Assets page of the web app;
+the API reads them. Each asset also carries `model` and `modelName`, the model that generated it
+(empty strings for uploads and links).
+
+```python
+# Mark a favorite, then list only favorites in one folder, A to Z.
+client.assets.update(hero["uri"], favorite=True)
+page = client.assets.list(favorite=True, collection_id="col_...", sort="name")
+
+# A character is a named, ordered set of images. Put its images, in order, into the model's
+# reference image field (get_model shows which field takes a list of images).
+mia = client.assets.characters.get("ety_...")
+references = [image["uri"] for image in mia["assets"]]  # ["spicy://a/ast_...", ...]
+```
+
+An unknown folder, and an unknown character, both fail with `404`. Characters used to be called
+personas: existing `spicy://p/<id>` references keep resolving to the same images, in your personal
+library only; new code should use the `spicy://a/` references a character lists.
+
+See the asset library guide:
+[organizing](https://docs.spicyapi.ai/docs/media#asset-library-organize) and
+[characters](https://docs.spicyapi.ai/docs/media#asset-library-characters).
 
 ## Results that are not files
 
@@ -149,8 +265,9 @@ a client is a public key. Call from your server, or put
 
 ## Errors
 
-Every failure raises `SpicyApiError` with `status`, `code`, `request_id` and `retry_after_seconds`.
-Branch on `code`, never on the message text — messages are translated, codes are not.
+Every failure raises `SpicyApiError` with `status`, `code`, `request_id`, `retry_after_seconds` and,
+when the server sends one, `reason` (see [Asset library](#asset-library)). Branch on `code` or
+`reason`, never on the message text — messages are translated, codes are not.
 
 `503` is shared by three different business codes, so reading the HTTP status alone is not enough:
 
@@ -165,6 +282,10 @@ Branch on `code`, never on the message text — messages are translated, codes a
 | `50302` | a synchronous generation failed upstream and was refunded | retry with a **new** idempotency key |
 
 `err.recovery` carries the same guidance at runtime.
+
+Retryable failures are retried with backoff inside one request's timeout. When the server's
+`Retry-After` is longer than what that timeout has left, the error is raised at once, with its
+`retry_after_seconds`, instead of being slept through into a local timeout.
 
 ## Links
 

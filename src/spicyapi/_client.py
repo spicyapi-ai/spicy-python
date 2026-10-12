@@ -13,6 +13,8 @@ safety bound, not a service guarantee.
 It covers the whole media workflow: discover a model, upload a reference file,
 confirm the price, create the task, wait for a terminal state, read the result,
 refresh an expired output link, and destroy the stored content afterwards.
+Files worth keeping go into the asset library (``client.assets``), where they
+get a stable ``spicy://a/`` reference that does not expire.
 Webhook signature verification is a module-level function so a web handler can
 use it without constructing a client.
 """
@@ -29,7 +31,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterator, Mapping
+import uuid
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 API_BASE_URL = "https://api.spicyapi.ai/api/v1"
@@ -45,7 +48,7 @@ ACTIVE_STATES = frozenset({"queued", "running"})
 # imports this module, so reading it the other way round would be a circular import; and the tests
 # load this file as a standalone module with no parent package, where a relative import is bound to
 # fail. Both __init__.py and pyproject read it from here.
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Local ceiling on response bodies. See _read_capped: this number is ours, not the contract's.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -78,12 +81,21 @@ DOCUMENT_CONTENT_TYPES = frozenset({
     "text/plain",
     "text/markdown",
 })
-UPLOAD_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_VIDEO_CONTENT_TYPES | DOCUMENT_CONTENT_TYPES
+# LoRA weights, for ``loras[].path``: a ``.safetensors`` file, and commit checks that it is
+# complete. The contract names no narrower type for it, so it travels as application/octet-stream.
+LORA_CONTENT_TYPES = frozenset({"application/octet-stream"})
+UPLOAD_CONTENT_TYPES = (
+    IMAGE_CONTENT_TYPES | AUDIO_VIDEO_CONTENT_TYPES | DOCUMENT_CONTENT_TYPES | LORA_CONTENT_TYPES
+)
 MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
 # Documents share the audio and video ceiling: a PDF or a slide deck with pictures in it is often
 # larger than any single image, and the platform signs both against the same 90 MiB line.
 MAX_AUDIO_VIDEO_UPLOAD_BYTES = 90 * 1024 * 1024
 MAX_DOCUMENT_UPLOAD_BYTES = MAX_AUDIO_VIDEO_UPLOAD_BYTES
+# LoRA weights have a ceiling of their own. A file this size can outlast the default ten-minute
+# upload timeout on an ordinary uplink, so raise upload_timeout_seconds for big ones; the ticket
+# itself stays valid for two hours.
+MAX_LORA_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 CONTENT_TYPE_BY_SUFFIX = {
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -101,6 +113,7 @@ CONTENT_TYPE_BY_SUFFIX = {
     ".png": "image/png",
     ".ppt": "application/vnd.ms-powerpoint",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".safetensors": "application/octet-stream",
     ".txt": "text/plain",
     ".wav": "audio/wav",
     ".webm": "video/webm",
@@ -111,6 +124,41 @@ CONTENT_TYPE_BY_SUFFIX = {
 
 WEBHOOK_TOLERANCE_SECONDS = 300
 WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
+
+# Prefix of a saved asset's stable reference, as in ``spicy://a/ast_...``.
+ASSET_URI_PREFIX = "spicy://a/"
+# Only used to cut the default name of an uploaded file; a name passed explicitly is the server's
+# to judge.
+ASSET_NAME_MAX_CHARS = 80
+# Orders of an asset listing. An unknown sort is refused here rather than spending a request, and a
+# slice of the per-minute read limit, on a 400.
+ASSET_SORTS = frozenset({"recent", "oldest", "name", "size"})
+ASSET_SOURCES = frozenset({"task_output", "upload", "url"})
+# Machine-readable reasons the asset library attaches to a failed response as ``data.reason``:
+#
+# - asset_library_locked (400): the library opens after the owner's first top-up.
+# - asset_library_full (400): the allowance's storage or item count is used up.
+# - asset_file_too_large (400): the file is above the plan's per-file limit.
+# - asset_daily_limit (429): today's (UTC) allowance of new assets is used up; see Retry-After.
+# - asset_storage_full (503): storage is temporarily full across the platform.
+# - asset_permission_denied (403): the key's team role does not allow this change.
+# - asset_workspace_forbidden (403): this key or workspace cannot reach that library.
+# - asset_entity_name_taken (409): the library already has a character with that name, ignoring
+#   case. Characters are named in the console, so the read-only API does not return it today.
+#
+# The set matches the published contract (scripts/check_contract.py and a unit test compare them).
+# The server may add reasons later, so treat it as open: SpicyApiError.reason carries any string the
+# server sends, unchanged, and an unknown one is best handled like an absent reason.
+ASSET_ERROR_REASONS = frozenset({
+    "asset_library_locked",
+    "asset_library_full",
+    "asset_file_too_large",
+    "asset_daily_limit",
+    "asset_storage_full",
+    "asset_permission_denied",
+    "asset_workspace_forbidden",
+    "asset_entity_name_taken",
+})
 
 # What to do about a business code, straight from the published contract. These
 # are the cases where blind retrying is either useless or wrong.
@@ -153,7 +201,13 @@ Transport = Callable[[str, str, Mapping[str, str], bytes | None, float], Transpo
 
 
 class SpicyApiError(RuntimeError):
-    """HTTP, envelope, or network failure with support correlation fields."""
+    """HTTP, envelope, or network failure with support correlation fields.
+
+    ``reason`` is the failure envelope's ``data.reason`` when the server sent one, and None
+    otherwise. Branch on it (or on ``code``) rather than on the message, which follows the
+    account's error language. See ASSET_ERROR_REASONS for the values in use today; an unknown value
+    is passed through as received.
+    """
 
     def __init__(
         self,
@@ -163,12 +217,14 @@ class SpicyApiError(RuntimeError):
         code: int | None = None,
         request_id: str = "",
         retry_after_seconds: float | None = None,
+        reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.request_id = request_id
         self.retry_after_seconds = retry_after_seconds
+        self.reason = reason
 
     @property
     def recovery(self) -> str:
@@ -389,7 +445,129 @@ def max_upload_bytes(content_type: str) -> int:
         return MAX_IMAGE_UPLOAD_BYTES
     if content_type in DOCUMENT_CONTENT_TYPES:
         return MAX_DOCUMENT_UPLOAD_BYTES
+    if content_type in LORA_CONTENT_TYPES:
+        return MAX_LORA_UPLOAD_BYTES
     return MAX_AUDIO_VIDEO_UPLOAD_BYTES
+
+
+def is_asset_error_reason(value: object) -> bool:
+    """Whether ``value`` is one of the asset library reasons the contract lists today."""
+    return isinstance(value, str) and value in ASSET_ERROR_REASONS
+
+
+def _failure_reason(data: object) -> str | None:
+    """``data.reason`` of a failure envelope, or None.
+
+    Any non-empty string is kept verbatim, so a reason added on the server later still reaches the
+    caller; anything else (absent, empty, not a string) reads as no reason at all.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    reason = data.get("reason")
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _require_identifier(value: object, label: str) -> str:
+    """Trim a caller-supplied identifier and refuse values that cannot be sent as-is.
+
+    These checks run before any request: an empty id would otherwise address the collection
+    (``/assets/`` lists instead of reading one asset), and a line break has no business in a URL or
+    a header.
+    """
+    if value is None:
+        raise ValueError(f"{label} is required")
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    normalised = value.strip()
+    if not normalised:
+        raise ValueError(f"{label} is required")
+    if "\r" in normalised or "\n" in normalised:
+        raise ValueError(f"{label} must not contain line breaks")
+    return normalised
+
+
+def _require_text(value: object, label: str) -> str:
+    """A required free-form value (an output key, a URL): present and not blank, sent unchanged.
+
+    Unlike an identifier it is not trimmed, because whitespace inside it may be meaningful and the
+    server is the one to judge its shape.
+    """
+    if value is None:
+        raise ValueError(f"{label} is required")
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if not value.strip():
+        raise ValueError(f"{label} must not be blank")
+    return value
+
+
+def _bare_asset_id(value: object, label: str = "asset_id") -> str:
+    """Accept either the bare id (``ast_...``) or the reference used in model inputs
+    (``spicy://a/ast_...``), so a value copied from either place works."""
+    trimmed = _require_identifier(value, label)
+    if trimmed.startswith(ASSET_URI_PREFIX):
+        return _require_identifier(trimmed[len(ASSET_URI_PREFIX):], label)
+    return trimmed
+
+
+def _asset_path(value: object) -> str:
+    return f"/assets/{urllib.parse.quote(_bare_asset_id(value), safe='')}"
+
+
+def _optional_text(value: str | None, label: str) -> str | None:
+    """A filter that is either left off (None) or a non-empty string.
+
+    An empty string is not "unset": the caller computed a filter and it came out empty. Dropping it
+    silently would hand back the unfiltered list; sending it earns a 400 that does not name the
+    parameter. Refuse it here by name, as list_tasks does.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if value == "":
+        raise ValueError(f"{label} must not be an empty string; omit it to leave that filter off")
+    return value
+
+
+def _optional_limit(limit: int | None) -> str | None:
+    # Only non-positive values are refused: they are unambiguously a caller error. The upper bound
+    # is the server's, for the same reason as in list_tasks.
+    if limit is None:
+        return None
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    return str(limit)
+
+
+def _with_query(path: str, values: Mapping[str, str | None]) -> str:
+    present = {key: value for key, value in values.items() if value is not None}
+    return f"{path}?{urllib.parse.urlencode(present)}" if present else path
+
+
+def _every_page(
+    first_cursor: str | None,
+    fetch_page: Callable[[str | None], Mapping[str, Any]],
+    what: str,
+) -> Iterator[dict[str, Any]]:
+    """Follow ``nextCursor`` until the last page, where it is absent.
+
+    A cursor that comes back twice would loop forever and burn the rate limit for nothing, so it is
+    refused.
+    """
+    seen: set[str] = set()
+    cursor = first_cursor
+    while True:
+        page = fetch_page(cursor)
+        items = page.get("items") if isinstance(page, Mapping) else None
+        yield from items or []
+        next_cursor = page.get("nextCursor") if isinstance(page, Mapping) else None
+        if not isinstance(next_cursor, str) or not next_cursor:
+            return
+        if next_cursor in seen:
+            raise SpicyApiError(f"{what} returned a cursor it had already returned", status=200)
+        seen.add(next_cursor)
+        cursor = next_cursor
 
 
 def compute_webhook_signature(
@@ -491,7 +669,383 @@ def verify_webhook(
     }
 
 
+class SpicyAssetCharacters:
+    """The characters of the library the key reaches, read-only.
+
+    A character is a named, ordered set of images arranged in the console. It references assets
+    instead of copying them, so each image carries its own ``spicy://a/<id>`` ``uri``. To use a
+    character in a generation request, put the ``uri`` of its images, in order, into the model's
+    reference image field.
+
+    Personas became characters in the personal library on 2026-10-12. Existing ``spicy://p/<id>``
+    references keep resolving to the same images; new code should use the ``spicy://a/``
+    references listed here.
+
+    Reach it as ``client.assets.characters``; it is not meant to be constructed directly.
+    """
+
+    def __init__(self, client: SpicyClient) -> None:
+        self._client = client
+
+    def _list_query(
+        self,
+        *,
+        asset_id: str | None,
+        cursor: str | None,
+        limit: int | None,
+    ) -> dict[str, str | None]:
+        return {
+            "assetId": None if asset_id is None else _bare_asset_id(asset_id),
+            "cursor": _optional_text(cursor, "cursor"),
+            "limit": _optional_limit(limit),
+        }
+
+    def list(
+        self,
+        *,
+        asset_id: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """One page of characters, newest first: ``items`` and, unless this is the last page,
+        ``nextCursor``.
+
+        ``asset_id`` (``ast_...`` or ``spicy://a/ast_...``) keeps only the characters that contain
+        that asset. ``limit`` is the page size; the server defaults to 50. Continue with
+        ``nextCursor``, or use iter_all.
+        """
+        query = self._list_query(asset_id=asset_id, cursor=cursor, limit=limit)
+        return self._client._request("GET", _with_query("/assets/entities", query))
+
+    def iter_all(
+        self,
+        *,
+        asset_id: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Every character, page by page. ``limit`` sets the page size, not the total.
+
+        The arguments are checked when this is called, not when iteration starts, so a bad value
+        fails where it was written.
+        """
+        query = self._list_query(asset_id=asset_id, cursor=cursor, limit=limit)
+
+        def fetch_page(page_cursor: str | None) -> Mapping[str, Any]:
+            return self._client._request(
+                "GET", _with_query("/assets/entities", {**query, "cursor": page_cursor})
+            )
+
+        return _every_page(query["cursor"], fetch_page, "character listing")
+
+    def get(self, character_id: str) -> dict[str, Any]:
+        """One character with its images in order, each with a fresh private ``previewUrl``.
+
+        An unknown character, and one outside the key's library, are both answered with 404.
+        """
+        encoded = urllib.parse.quote(_require_identifier(character_id, "character_id"), safe="")
+        return self._client._request("GET", f"/assets/entities/{encoded}")
+
+
+class SpicyAssets:
+    """The asset library the key reaches.
+
+    That is the personal library for a personal key, and the team's shared library for a team key.
+    Files are kept until they are deleted, each with a stable ``spicy://a/<id>`` reference that
+    works in any media field of model inputs sent with keys of the same workspace. With a team key,
+    the creator's current role decides what may change (see ``usage()["scope"]``).
+
+    Reach it as ``client.assets``; it is not meant to be constructed directly. Responses never
+    contain a public or permanent link: ``previewUrl`` is a private preview signed for at most 20
+    minutes, so store ``uri``, never ``previewUrl``.
+
+    Asset ids are accepted as ``ast_...`` or as the ``spicy://a/ast_...`` reference. Invalid
+    arguments raise ValueError before any request is sent.
+    """
+
+    def __init__(self, client: SpicyClient) -> None:
+        self._client = client
+        #: Read-only access to the library's characters.
+        self.characters = SpicyAssetCharacters(client)
+
+    def create(
+        self,
+        *,
+        source: str,
+        task_id: str | None = None,
+        key: str | None = None,
+        index: int | None = None,
+        file_id: str | None = None,
+        url: str | None = None,
+        name: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Save a file to the library and return the saved asset.
+
+        Exactly one source per call:
+
+        - ``source="task_output"`` with ``task_id`` and either the output ``key`` or its zero-based
+          ``index`` (the order of ``output.assets`` in the task record). The task must be one of
+          your own successful tasks; with a team key, one of the team's.
+        - ``source="upload"`` with ``file_id``, a committed upload (``fil_...`` or
+          ``spicy://f/fil_...``).
+        - ``source="url"`` with ``url``, a public http or https address on port 80 or 443 without
+          credentials. The server downloads it once and reads the type from the file itself.
+
+        ``name`` is optional; the server defaults to "Saved asset". Saving the same source again
+        returns the asset you already have and uses no extra space.
+
+        The server requires an Idempotency-Key on every save. One is generated when
+        ``idempotency_key`` is omitted, which also makes the transport-level retry safe: every
+        attempt of this call carries the same key. Pass your own to replay the same save safely
+        after an uncertain response, for example across a process restart; the server binds the
+        key to the exact request for 24 hours.
+        """
+        if source not in ASSET_SOURCES:
+            raise ValueError(f"source must be one of {sorted(ASSET_SOURCES)}, got {source!r}")
+        given = {
+            "task_id": task_id, "key": key, "index": index, "file_id": file_id, "url": url,
+        }
+        allowed = {
+            "task_output": {"task_id", "key", "index"},
+            "upload": {"file_id"},
+            "url": {"url"},
+        }[source]
+        # A save has exactly one source, so a field that belongs to another one is a caller
+        # mistake. The TypeScript client rules it out with its types; this is the runtime
+        # equivalent.
+        foreign = sorted(
+            field for field, value in given.items() if value is not None and field not in allowed
+        )
+        if foreign:
+            raise ValueError(
+                f"{', '.join(foreign)} does not apply to source={source!r}; "
+                "send exactly one source per save"
+            )
+
+        body: dict[str, Any] = {"source": source}
+        if source == "task_output":
+            body["taskId"] = _require_identifier(task_id, "task_id")
+            if key is not None:
+                body["key"] = _require_text(key, "key")
+            if index is not None:
+                if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                    raise ValueError("index must be a non-negative integer")
+                body["index"] = index
+        elif source == "upload":
+            body["fileId"] = _require_identifier(file_id, "file_id")
+        else:
+            body["url"] = _require_text(url, "url")
+        if name is not None:
+            if not isinstance(name, str):
+                raise ValueError("name must be a string")
+            body["name"] = name
+
+        header_key = (
+            str(uuid.uuid4())
+            if idempotency_key is None
+            else _require_identifier(idempotency_key, "idempotency_key")
+        )
+        return self._client._request(
+            "POST", "/assets", body=body, headers={"Idempotency-Key": header_key}
+        )
+
+    def _list_query(
+        self,
+        *,
+        kind: str | None,
+        source: str | Sequence[str] | None,
+        q: str | None,
+        favorite: bool | None,
+        collection_id: str | None,
+        entity_id: str | None,
+        sort: str | None,
+        cursor: str | None,
+        limit: int | None,
+    ) -> dict[str, str | None]:
+        sources: str | None = None
+        if isinstance(source, str):
+            sources = _optional_text(source, "source")
+        elif source is not None:
+            values = [_optional_text(item, "source") for item in source]
+            # An empty sequence filters nothing, so it is the same as leaving the filter off.
+            sources = ",".join(value for value in values if value) or None
+        if favorite is not None and not isinstance(favorite, bool):
+            raise ValueError("favorite must be True, False or None")
+        if sort is not None and sort not in ASSET_SORTS:
+            raise ValueError(f"sort must be one of {sorted(ASSET_SORTS)}, got {sort!r}")
+        return {
+            "kind": _optional_text(kind, "kind"),
+            "source": sources,
+            "q": _optional_text(q, "q"),
+            # False is a filter of its own ("not favorites"), so it is sent rather than dropped;
+            # only None leaves the filter off.
+            "favorite": None if favorite is None else ("true" if favorite else "false"),
+            "collectionId": (
+                None if collection_id is None
+                else _require_identifier(collection_id, "collection_id")
+            ),
+            "entityId": None if entity_id is None else _require_identifier(entity_id, "entity_id"),
+            "sort": sort,
+            "cursor": _optional_text(cursor, "cursor"),
+            "limit": _optional_limit(limit),
+        }
+
+    def list(
+        self,
+        *,
+        kind: str | None = None,
+        source: str | Sequence[str] | None = None,
+        q: str | None = None,
+        favorite: bool | None = None,
+        collection_id: str | None = None,
+        entity_id: str | None = None,
+        sort: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """One page of ready assets: ``items`` and, unless this is the last page, ``nextCursor``.
+
+        - ``kind``: ``image``, ``video`` or ``audio``.
+        - ``source``: one of ``task_output``, ``upload`` and ``url``, or a list of them (sent
+          comma-separated).
+        - ``q``: a case-insensitive substring of the asset name.
+        - ``favorite``: True lists only favorites, False only assets that are not favorites; None
+          leaves the filter off.
+        - ``collection_id``: only the assets in this folder (a collection of the same library).
+          Folders are created and edited in the console; an id outside the key's library is
+          answered with 404.
+        - ``entity_id``: only the images of this character (see ``characters``); an unknown id
+          gives an empty page.
+        - ``sort``: ``recent`` (the default, newest first), ``oldest``, ``name`` (A to Z, ignoring
+          case) or ``size`` (largest first).
+        - ``cursor``: the previous page's ``nextCursor``, unchanged and with the same filters and
+          ``sort``; never construct one. A cursor sent with a different ``sort`` is rejected with
+          400, and that error is raised as-is rather than retried.
+        - ``limit``: the page size; the server defaults to 100.
+
+        Use iter_all to walk every page.
+        """
+        query = self._list_query(
+            kind=kind, source=source, q=q, favorite=favorite, collection_id=collection_id,
+            entity_id=entity_id, sort=sort, cursor=cursor, limit=limit,
+        )
+        return self._client._request("GET", _with_query("/assets", query))
+
+    def iter_all(
+        self,
+        *,
+        kind: str | None = None,
+        source: str | Sequence[str] | None = None,
+        q: str | None = None,
+        favorite: bool | None = None,
+        collection_id: str | None = None,
+        entity_id: str | None = None,
+        sort: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Every matching asset, page by page, following ``nextCursor`` until the last page.
+
+        The same filters and ``sort`` go out on every page, as a cursor only works with the ones it
+        was issued for. ``limit`` sets the page size, not the total; stop iterating to stop
+        fetching. The arguments are checked when this is called, not when iteration starts.
+        """
+        query = self._list_query(
+            kind=kind, source=source, q=q, favorite=favorite, collection_id=collection_id,
+            entity_id=entity_id, sort=sort, cursor=cursor, limit=limit,
+        )
+
+        def fetch_page(page_cursor: str | None) -> Mapping[str, Any]:
+            return self._client._request(
+                "GET", _with_query("/assets", {**query, "cursor": page_cursor})
+            )
+
+        return _every_page(query["cursor"], fetch_page, "asset listing")
+
+    def get(self, asset_id: str) -> dict[str, Any]:
+        """One asset with a fresh private ``previewUrl``.
+
+        An unknown asset, another account's asset and one in a library this key does not reach
+        are all answered with the same 404.
+        """
+        return self._client._request("GET", _asset_path(asset_id))
+
+    def update(
+        self,
+        asset_id: str,
+        *,
+        name: str | None = None,
+        favorite: bool | None = None,
+    ) -> dict[str, Any]:
+        """Rename an asset, mark or unmark it as a favorite, or both; returns the updated asset.
+
+        Only the fields you pass change, and the ``uri`` stays the same. Favorites belong to the
+        library, so everyone in a team sees the same ones. Repeating the request is safe, so no
+        Idempotency-Key is sent.
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            if not isinstance(name, str):
+                raise ValueError("name must be a string")
+            body["name"] = name
+        if favorite is not None:
+            if not isinstance(favorite, bool):
+                raise ValueError("favorite must be True or False")
+            body["favorite"] = favorite
+        if not body:
+            # The server would answer an empty body with a misleading "invalid name".
+            raise ValueError("update needs a name, a favorite flag, or both")
+        return self._client._request("PATCH", _asset_path(asset_id), body=body)
+
+    def delete(self, asset_id: str) -> dict[str, Any]:
+        """Delete an asset; returns ``{"id": ..., "deleted": True}``.
+
+        It disappears at once and its ``uri`` stops working in new requests. Deleting an unknown
+        or already deleted asset returns the same result, so repeating it is safe and no
+        Idempotency-Key is sent.
+        """
+        return self._client._request("DELETE", _asset_path(asset_id))
+
+    def usage(self) -> dict[str, Any]:
+        """The storage plan, what is stored, the limits and how many assets were saved today.
+
+        ``scope`` says which library the key reaches (``workspaceId``, ``personal``), the role it
+        acts with and whether it may write (``canWrite``) or top up (``canTopUp``). When
+        ``canTopUp`` is false (a team key whose creator is not the owner), ``lifetimeTopupUsd``
+        and ``topupToNextTierUsd`` are omitted, so read them with ``.get``.
+        """
+        return self._client._request("GET", "/assets/usage")
+
+    def upload_file(
+        self,
+        path: str,
+        *,
+        name: str | None = None,
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload a local file and save it to the library in one call; returns the saved asset.
+
+        The upload goes through ``client.upload_file``, so its type and size limits apply.
+        ``name`` defaults to the file's base name, cut to 80 characters. Every call uploads again,
+        so there is no idempotency key to pass: the save step uses a fresh one for its own retries.
+        Nothing is saved when the upload fails.
+        """
+        uploaded = self._client.upload_file(path, content_type=content_type)
+        if name is None:
+            base = os.path.basename(os.fspath(path)).strip()
+            name = base[:ASSET_NAME_MAX_CHARS] or None
+        return self.create(source="upload", file_id=str(uploaded["fileId"]), name=name)
+
+
 class SpicyClient:
+    assets: SpicyAssets
+    """The asset library the key reaches: personal, or the team's shared library for a team key.
+
+    Save files once and reference them as ``spicy://a/<id>`` in any media field of model inputs
+    sent with keys of the same workspace, until they are deleted.
+    """
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -518,6 +1072,7 @@ class SpicyClient:
         self.upload_timeout_seconds = upload_timeout_seconds
         self.wait_timeout_seconds = wait_timeout_seconds
         self.max_retries = max_retries
+        self.assets = SpicyAssets(self)
 
     # ── Models ────────────────────────────────────────────────────────────
 
@@ -915,7 +1470,12 @@ class SpicyClient:
         Put the returned ``uri`` into the model input field whose x-ui.widget
         is "upload" (or inside the list for "multi-upload"), or into the
         ``url`` of an ``image_url`` / ``video_url`` / ``audio_url`` part of a
-        chat message sent through an OpenAI-compatible library.
+        chat message sent through an OpenAI-compatible library. LoRA weights
+        (``application/octet-stream``, a ``.safetensors`` file) go into
+        ``loras[].path``.
+
+        The URI lasts one day; to keep a file longer, save it to the asset
+        library with ``client.assets.create(source="upload", file_id=...)``.
         """
         ticket = self.create_upload_url(content_type=content_type, byte_count=len(data))
         max_bytes = ticket.get("maxBytes")
@@ -1116,7 +1676,21 @@ class SpicyClient:
             resend_helps = code not in NON_RETRYABLE_CODES and (
                 status in RETRYABLE_HTTP or code in RETRYABLE_CODES
             )
-            if failed and retryable and resend_helps and attempt < self.max_retries:
+            # When the server asks for a wait longer than this call has left, hand its error back
+            # rather than sleeping out the budget. Otherwise the caller gets "request exceeded the
+            # local timeout" in place of what the server actually said - and for the asset
+            # library's daily limit (429 with Retry-After until 00:00 UTC) that would bury the
+            # reason, the Retry-After and the request_id under a timeout that never happened.
+            outlasts_budget = (
+                retry_after is not None and retry_after > request_deadline - self.monotonic()
+            )
+            if (
+                failed
+                and retryable
+                and resend_helps
+                and not outlasts_budget
+                and attempt < self.max_retries
+            ):
                 self.sleep(min(
                     self._retry_delay(attempt, _header(response_headers, "Retry-After")),
                     max(0.0, request_deadline - self.monotonic()),
@@ -1129,6 +1703,9 @@ class SpicyClient:
                     code=code if isinstance(code, int) else None,
                     request_id=request_id if isinstance(request_id, str) else "",
                     retry_after_seconds=retry_after,
+                    reason=_failure_reason(
+                        envelope.get("data") if isinstance(envelope, dict) else None
+                    ),
                 )
             if "data" not in envelope:
                 raise SpicyApiError(
