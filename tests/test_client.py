@@ -636,7 +636,8 @@ class ResultAndErrorSemanticsTests(unittest.TestCase):
 
     def test_output_embeddings(self):
         vectors = {"inputTokens": 3, "data": [{"index": 0, "embedding": [-0.25, 0.5]}]}
-        self.assertEqual(client_module.output_embeddings({"output": {"embeddings": vectors}}), vectors)
+        task = {"output": {"embeddings": vectors}}
+        self.assertEqual(client_module.output_embeddings(task), vectors)
         for task in ({}, {"output": None}, {"output": {"embeddings": "invalid"}}):
             self.assertIsNone(client_module.output_embeddings(task))
 
