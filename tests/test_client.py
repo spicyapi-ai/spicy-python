@@ -634,6 +634,12 @@ class ResultAndErrorSemanticsTests(unittest.TestCase):
         self.assertIsNone(client_module.output_text(failed))
         self.assertIsNone(client_module.output_transcript(failed))
 
+    def test_output_embeddings(self):
+        vectors = {"inputTokens": 3, "data": [{"index": 0, "embedding": [-0.25, 0.5]}]}
+        self.assertEqual(client_module.output_embeddings({"output": {"embeddings": vectors}}), vectors)
+        for task in ({}, {"output": None}, {"output": {"embeddings": "invalid"}}):
+            self.assertIsNone(client_module.output_embeddings(task))
+
     def test_transcript_is_read_without_assuming_it_is_there(self):
         transcript = {
             "text": "hello there",
