@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Add `output_embeddings()` for reading indexed vectors and their measured input token count.
+
 ## 0.3.0
 
 ### Added

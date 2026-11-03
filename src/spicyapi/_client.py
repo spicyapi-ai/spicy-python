@@ -48,7 +48,7 @@ ACTIVE_STATES = frozenset({"queued", "running"})
 # imports this module, so reading it the other way round would be a circular import; and the tests
 # load this file as a standalone module with no parent package, where a relative import is bound to
 # fail. Both __init__.py and pyproject read it from here.
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # Local ceiling on response bodies. See _read_capped: this number is ours, not the contract's.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -408,6 +408,15 @@ def output_transcript(task: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     transcript = output.get("transcript")
     return dict(transcript) if isinstance(transcript, Mapping) else None
+
+
+def output_embeddings(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return inputTokens and indexed vectors from an embedding task, when present."""
+    output = task.get("output")
+    if not isinstance(output, Mapping):
+        return None
+    embeddings = output.get("embeddings")
+    return dict(embeddings) if isinstance(embeddings, Mapping) else None
 
 
 def output_assets(task: Mapping[str, Any]) -> list[dict[str, Any]]:

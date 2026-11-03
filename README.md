@@ -183,6 +183,9 @@ See the asset library guide:
 
 ## Results that are not files
 
+Embedding tasks return indexed vectors and an input token count through `output_embeddings(task)`.
+Transcription endpoints can also return timed phrases in `output_transcript(task)["segments"]`.
+
 Most models return files in `output.assets`. Chat and transcription answer in text instead, so read
 results through the helpers rather than indexing `output` directly — a successful task may simply
 not have the key you reached for.
